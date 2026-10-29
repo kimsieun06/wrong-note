@@ -1,38 +1,105 @@
 import json
 import random
-from pathlib import Path
 import streamlit as st
+from supabase import create_client
 
 st.set_page_config(page_title="스마트 오답 노트", page_icon="📝")
-DATA = Path(__file__).with_name("wrong_notes.json")
 FIELDS = ("과목", "문제", "오답", "정답", "해설")
+COLUMNS = dict(zip(FIELDS, ("subject", "question", "wrong_answer", "correct_answer", "explanation")))
 
 def valid_notes(value):
-    return isinstance(value, list) and all(isinstance(n, dict) and all(isinstance(n.get(f), str) and n[f].strip() for f in FIELDS) for n in value)
+    return isinstance(value, list) and len(value) <= 500 and all(isinstance(n, dict) and all(isinstance(n.get(f), str) and 0 < len(n[f].strip()) <= 10000 for f in FIELDS) for n in value)
 
-def save():
-    try:
-        DATA.write_text(json.dumps(st.session_state.notes, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        st.warning("서버 파일 저장에 실패했습니다. JSON 백업을 다운로드해 주세요.")
-
-if "notes" not in st.session_state:
-    try:
-        data = json.loads(DATA.read_text(encoding="utf-8"))
-        if not valid_notes(data):
-            raise ValueError("잘못된 데이터 형식")
-        st.session_state.notes = data
-    except FileNotFoundError:
-        st.session_state.notes = []
-    except (OSError, ValueError):
-        st.session_state.notes = []
-        st.warning("저장 파일을 읽지 못했습니다. 백업 파일을 불러와 주세요.")
-
+try:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+except Exception:
+    st.error("관리자 설정이 필요합니다. Streamlit Secrets에 SUPABASE_URL과 SUPABASE_KEY를 입력해 주세요.")
+    st.stop()
+# 절대 cache_resource로 공유하지 않습니다. 사용자 세션마다 별도 인증 클라이언트입니다.
+if "db" not in st.session_state:
+    st.session_state.db = create_client(url, key)
+db = st.session_state.db
 st.title("📝 스마트 오답 노트")
-st.caption("개인 테스트용 · 서버 파일은 영구 보관이 보장되지 않습니다. 중요한 내용은 JSON 백업을 받으세요.")
-st.warning("이 버전은 로그인·사용자별 저장 기능이 없습니다. 공개 배포하면 다른 방문자와 데이터가 공유될 수 있으므로 개인정보는 입력하지 마세요.")
-page = st.sidebar.radio("메뉴", ["오답 등록", "퀴즈 풀기", "조회 · 수정 · 삭제", "백업 · 복원"])
-notes = st.session_state.notes
+
+if not st.session_state.get("uid"):
+    login_tab, signup_tab = st.tabs(["로그인", "회원가입"])
+    with login_tab:
+        with st.form("login"):
+            email = st.text_input("이메일")
+            password = st.text_input("비밀번호", type="password")
+            submitted = st.form_submit_button("로그인")
+        if submitted:
+            try:
+                result = db.auth.sign_in_with_password({"email": email.strip(), "password": password})
+                if result.user and result.session:
+                    st.session_state.uid = result.user.id
+                    st.session_state.email = result.user.email
+                    st.rerun()
+                else:
+                    st.error("이메일 인증 후 다시 로그인해 주세요.")
+            except Exception:
+                st.error("로그인하지 못했습니다. 이메일·비밀번호, 이메일 인증 여부 및 인터넷 연결을 확인해 주세요.")
+    with signup_tab:
+        with st.form("signup"):
+            name = st.text_input("닉네임 (실명 대신 별명을 사용하세요)", max_chars=40)
+            new_email = st.text_input("가입 이메일")
+            new_password = st.text_input("가입 비밀번호 (12자 이상)", type="password")
+            confirm = st.text_input("비밀번호 확인", type="password")
+            consent = st.checkbox("이메일·닉네임·오답이 외부 클라우드에 저장됨을 확인했습니다.")
+            signup = st.form_submit_button("회원가입")
+        if signup:
+            if not name.strip() or not new_email.strip() or len(new_password) < 12 or new_password != confirm or not consent:
+                st.error("입력 항목, 비밀번호 길이·일치 여부, 저장 안내 확인을 점검해 주세요.")
+            else:
+                try:
+                    db.auth.sign_up({"email": new_email.strip(), "password": new_password, "options": {"data": {"display_name": name.strip()}}})
+                    st.success("가입 요청을 보냈습니다. 이메일 인증을 켜둔 경우 메일의 인증 링크를 누른 뒤 로그인해 주세요. 메일이 없으면 스팸함을 확인하세요.")
+                except Exception:
+                    st.error("가입 요청에 실패했습니다. 이메일 형식, 비밀번호 정책 또는 잠시 후 재시도를 확인하세요.")
+    st.caption("비밀번호는 앱 데이터베이스에 직접 저장하지 않고 Supabase Auth가 처리합니다.")
+    st.stop()
+
+uid = st.session_state.uid
+st.sidebar.caption(st.session_state.get("email", ""))
+if st.sidebar.button("로그아웃"):
+    try:
+        db.auth.sign_out()
+    except Exception:
+        pass
+    st.session_state.clear()
+    st.rerun()
+
+def db_action(action):
+    try:
+        return action()
+    except Exception:
+        st.error("저장소 요청이 실패했습니다. 네트워크·DB 설정을 확인하거나 다시 로그인해 주세요. 저장 완료가 표시되지 않았다면 저장되지 않았을 수 있습니다.")
+        st.stop()
+
+def add_note(values):
+    payload = {COLUMNS[f]: values[f].strip() for f in FIELDS}
+    payload["user_id"] = uid
+    db_action(lambda: db.table("notes").insert(payload).execute())
+
+def update_note(note_id, values):
+    payload = {COLUMNS[f]: values[f].strip() for f in FIELDS}
+    db_action(lambda: db.table("notes").update(payload).eq("id", note_id).eq("user_id", uid).execute())
+
+def delete_note(note_id):
+    db_action(lambda: db.table("notes").delete().eq("id", note_id).eq("user_id", uid).execute())
+
+rows = []
+start = 0
+while True:
+    batch = db_action(lambda: db.table("notes").select("*").eq("user_id", uid).order("created_at").order("id").range(start, start + 499).execute()).data
+    rows.extend(batch)
+    if len(batch) < 500:
+        break
+    start += 500
+notes = [{"id": r["id"], **{f: r[c] for f, c in COLUMNS.items()}} for r in rows]
+st.caption("로그인 계정별 클라우드 저장 · 앱을 껐다 켜도 저장된 오답을 다시 불러옵니다.")
+page = st.sidebar.radio("메뉴", ["오답 등록", "퀴즈 풀기", "조회 · 수정 · 삭제", "백업 · 가져오기"])
 
 if page == "오답 등록":
     with st.form("register", clear_on_submit=True):
@@ -40,8 +107,7 @@ if page == "오답 등록":
         submitted = st.form_submit_button("저장하기")
     if submitted:
         if all(v.strip() for v in values.values()):
-            notes.append({f: v.strip() for f, v in values.items()})
-            save()
+            add_note(values)
             st.success("오답을 저장했어요!")
         else:
             st.error("모든 항목을 입력해 주세요.")
@@ -71,15 +137,12 @@ elif page == "퀴즈 풀기":
                 if not answer.strip():
                     st.warning("정답을 입력해 주세요.")
                 else:
-                    q["checked"] = True
-                    q["correct"] = answer.strip() == item["정답"].strip()
-                    if q["correct"]:
+                    correct = answer.strip() == item["정답"].strip()
+                    if correct:
+                        delete_note(item["id"])
                         q["score"] += 1
-                        for i, n in enumerate(notes):
-                            if n is item:
-                                del notes[i]
-                                save()
-                                break
+                    q["checked"] = True
+                    q["correct"] = correct
                     st.rerun()
             if q["checked"]:
                 if q["correct"]:
@@ -101,37 +164,37 @@ elif page == "조회 · 수정 · 삭제":
     else:
         index = st.selectbox("문제 선택", range(len(notes)), format_func=lambda i: f"{i+1}. [{notes[i]['과목']}] {notes[i]['문제']}")
         note = notes[index]
-        with st.form(f"edit_{index}"):
+        with st.form(f"edit_{note['id']}"):
             updated = {f: st.text_area(f, value=note[f]) for f in FIELDS}
             update = st.form_submit_button("수정 저장")
         if update:
             if all(v.strip() for v in updated.values()):
-                notes[index] = {f: v.strip() for f, v in updated.items()}
+                update_note(note["id"], updated)
                 st.session_state.pop("quiz", None)
-                save()
                 st.success("수정했습니다. 다른 메뉴로 이동하면 변경 내용을 볼 수 있어요.")
             else:
                 st.error("모든 항목을 입력해 주세요.")
-        confirm = st.checkbox("선택한 문제를 삭제하는 데 동의합니다.", key=f"confirm_{index}")
+        confirm = st.checkbox("선택한 문제를 삭제하는 데 동의합니다.", key=f"confirm_{note['id']}")
         if st.button("선택한 문제 삭제", disabled=not confirm):
-            del notes[index]
+            delete_note(note["id"])
             st.session_state.pop("quiz", None)
-            save()
             st.rerun()
 
 else:
-    st.download_button("📥 오답 JSON 백업", json.dumps(notes, ensure_ascii=False, indent=2), file_name="wrong_notes.json", mime="application/json")
-    uploaded = st.file_uploader("백업 JSON 불러오기", type=["json"])
-    st.caption("복원하면 기존 목록을 백업 파일의 내용으로 교체합니다.")
-    agree = st.checkbox("기존 목록 교체에 동의합니다.")
-    if st.button("백업으로 복원", disabled=uploaded is None or not agree):
+    backup = [{f: n[f] for f in FIELDS} for n in notes]
+    st.download_button("📥 오답 JSON 백업", json.dumps(backup, ensure_ascii=False, indent=2), file_name="wrong_notes.json", mime="application/json")
+    uploaded = st.file_uploader("기존 JSON 가져오기 (최대 500개)", type=["json"])
+    st.caption("기존 오답을 삭제하지 않고 추가합니다. 같은 파일을 다시 가져오면 중복됩니다.")
+    if st.button("내 계정으로 가져오기", disabled=uploaded is None):
         try:
             restored = json.loads(uploaded.getvalue().decode("utf-8-sig"))
             if not valid_notes(restored):
-                raise ValueError("필수 항목이 누락되었거나 형식이 잘못되었습니다.")
-            st.session_state.notes = restored
+                raise ValueError("항목과 개수를 확인하세요.")
+        except (ValueError, UnicodeError):
+            st.error("올바른 오답 JSON인지 확인해 주세요. 각 항목은 1~10000자, 최대 500개입니다.")
+        else:
+            payload = [{"user_id": uid, **{COLUMNS[f]: n[f].strip() for f in FIELDS}} for n in restored]
+            if payload:
+                db_action(lambda: db.table("notes").insert(payload).execute())
             st.session_state.pop("quiz", None)
-            save()
-            st.success("복원했습니다.")
-        except (ValueError, UnicodeError) as e:
-            st.error(f"파일을 확인해 주세요: {e}")
+            st.success("가져왔습니다. 조회 메뉴에서 확인해 주세요.")
